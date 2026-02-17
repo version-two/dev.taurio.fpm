@@ -24,7 +24,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const INTERNAL_PORT_OFFSET: u16 = 10000;
+/// Each pool gets a dedicated worker port range so multiple pools don't overlap.
+/// Range: 20000 + (base_port % 400) * 100 + worker_index
+/// This gives each pool up to 100 worker slots in non-overlapping ranges.
+const WORKER_PORT_BASE: u16 = 20000;
+const WORKER_PORT_SLOTS: u16 = 100;
+
+#[inline]
+fn worker_port(base_port: u16, idx: usize) -> u16 {
+    WORKER_PORT_BASE + (base_port % 400) * WORKER_PORT_SLOTS + idx as u16
+}
 const INITIAL_STARTUP_WAIT_MS: u64 = 150;
 const WATCHDOG_INTERVAL_MS: u64 = 500;
 const STATS_WRITE_INTERVAL_SECS: u64 = 2;
@@ -128,7 +137,7 @@ impl Pool {
         let mut slots = Vec::with_capacity(max_workers);
         let mut children = Vec::with_capacity(max_workers);
         for i in 0..max_workers {
-            let port = base_port + INTERNAL_PORT_OFFSET + i as u16;
+            let port = worker_port(base_port, i);
             slots.push(WorkerSlot {
                 port,
                 active: AtomicBool::new(false),
@@ -228,7 +237,7 @@ impl Pool {
 
     /// Lock-free worker release.
     fn release(&self, port: u16) {
-        let idx = (port - self.base_port - INTERNAL_PORT_OFFSET) as usize;
+        let idx = (port - worker_port(self.base_port, 0)) as usize;
         if idx < self.max_workers {
             let slot = &self.slots[idx];
             slot.busy.store(false, Ordering::Release);
@@ -256,8 +265,10 @@ impl Pool {
                 .map(|c| matches!(c.try_wait(), Ok(None)))
                 .unwrap_or(false);
 
-            if !alive && !slot.busy.load(Ordering::Acquire) {
-                // Worker died — respawn if we need it (under min_workers always respawn)
+            if !alive {
+                // Worker died — clear busy flag (stuck requests already failed)
+                slot.busy.store(false, Ordering::Release);
+                // Respawn if we need it (under min_workers always respawn)
                 if active_count <= self.min_workers {
                     let port = slot.port;
                     if let Ok(child) = spawn_php_cgi(&self.php_cgi_path, &self.working_dir, port) {
@@ -424,16 +435,28 @@ fn pipe_bidirectional(mut client: TcpStream, mut upstream: TcpStream) {
 
     // Upstream → Client (response) in the current thread
     let mut buf = [0u8; PIPE_BUF_SIZE];
+    let mut total_response_bytes = 0usize;
     loop {
         match upstream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                total_response_bytes += n;
                 if client.write_all(&buf[..n]).is_err() {
                     break;
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
-            Err(_) => break,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                if total_response_bytes == 0 {
+                    eprintln!("taurio-fpm: upstream timeout with 0 response bytes ({})", e.kind());
+                }
+                break;
+            }
+            Err(ref e) => {
+                if total_response_bytes == 0 {
+                    eprintln!("taurio-fpm: upstream read error with 0 response bytes: {}", e);
+                }
+                break;
+            }
         }
     }
     let _ = client.shutdown(std::net::Shutdown::Write);
@@ -712,29 +735,54 @@ fn main() {
 }
 
 /// Connect to a php-cgi worker and pipe the request/response.
+/// If the initial worker is unreachable, try to acquire a different one (up to 2 retries).
 fn dispatch_to_worker(stream: TcpStream, worker_port: u16, pool: &Pool) {
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", worker_port).parse().unwrap();
+    let mut current_port = worker_port;
+    let mut retries = 0;
 
-    // Fast connect with brief retry for freshly-spawned workers
-    let upstream = {
-        let start = Instant::now();
-        loop {
-            match TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
-                Ok(s) => break Some(s),
-                Err(_) if start.elapsed() < Duration::from_millis(1500) => {
-                    thread::sleep(Duration::from_millis(10));
+    loop {
+        let addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", current_port).parse().unwrap();
+
+        // Fast connect with brief retry for freshly-spawned workers
+        let upstream = {
+            let start = Instant::now();
+            loop {
+                match TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+                    Ok(s) => break Some(s),
+                    Err(_) if start.elapsed() < Duration::from_millis(1500) => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break None,
                 }
-                Err(_) => break None,
             }
+        };
+
+        if let Some(upstream) = upstream {
+            let _ = upstream.set_nodelay(true);
+            pipe_bidirectional(stream, upstream);
+            pool.release(current_port);
+            return;
         }
-    };
 
-    if let Some(upstream) = upstream {
-        let _ = upstream.set_nodelay(true);
-        pipe_bidirectional(stream, upstream);
+        // Connect failed — release this worker and try another
+        eprintln!(
+            "taurio-fpm: connect to worker port {} failed (attempt {})",
+            current_port,
+            retries + 1
+        );
+        pool.release(current_port);
+        retries += 1;
+        if retries >= 2 {
+            break;
+        }
+        // Try to acquire a different worker
+        match pool.acquire() {
+            Some(p) => current_port = p,
+            None => break,
+        }
     }
-
-    pool.release(worker_port);
+    // All retries exhausted — drop the client stream (nginx gets 502)
 }
 
 /// Simple Ctrl+C handler using Windows API directly.
