@@ -397,70 +397,89 @@ impl Pool {
     }
 }
 
-// ── High-performance bidirectional pipe ──────────────────────────────────
+// ── FastCGI-aware sequential pipe ────────────────────────────────────────
 
+/// FastCGI record type: FCGI_STDIN (carries request body; empty = end of request)
+const FCGI_STDIN: u8 = 5;
+
+/// Check if the buffer contains a complete FastCGI request.
+/// A complete request ends with an empty FCGI_STDIN record (type=5, contentLength=0).
+fn fcgi_request_complete(data: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos + 8 <= data.len() {
+        let record_type = data[pos + 1];
+        let content_len = u16::from_be_bytes([data[pos + 4], data[pos + 5]]) as usize;
+        let padding_len = data[pos + 6] as usize;
+        let record_total = 8 + content_len + padding_len;
+        if pos + record_total > data.len() {
+            return false; // incomplete record
+        }
+        if record_type == FCGI_STDIN && content_len == 0 {
+            return true;
+        }
+        pos += record_total;
+    }
+    false
+}
+
+/// Pipe a FastCGI request/response between nginx (client) and php-cgi (upstream).
+///
+/// Sequential approach: read the complete FastCGI request (using protocol-aware
+/// parsing), forward to worker, stream response back. No threads, no socket
+/// clones — eliminates Windows TCP close race conditions entirely.
 fn pipe_bidirectional(mut client: TcpStream, mut upstream: TcpStream) {
-    let timeout = Some(Duration::from_secs(STREAM_TIMEOUT_SECS));
-    let _ = client.set_read_timeout(timeout);
-    let _ = client.set_write_timeout(timeout);
-    let _ = upstream.set_read_timeout(timeout);
-    let _ = upstream.set_write_timeout(timeout);
+    let mut buf = [0u8; PIPE_BUF_SIZE];
 
-    let mut client2 = match client.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut upstream2 = match upstream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    // Client → Upstream (request body) in a separate thread
-    let t = thread::spawn(move || {
-        let mut buf = [0u8; PIPE_BUF_SIZE];
-        loop {
-            match client2.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if upstream2.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
+    // Phase 1: Read complete FastCGI request from nginx.
+    let mut request = Vec::with_capacity(8192);
+    let _ = client.set_read_timeout(Some(Duration::from_secs(STREAM_TIMEOUT_SECS)));
+    loop {
+        match client.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                request.extend_from_slice(&buf[..n]);
+                if fcgi_request_complete(&request) {
+                    break;
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
-                Err(_) => break,
             }
         }
-        let _ = upstream2.shutdown(std::net::Shutdown::Write);
-    });
+    }
 
-    // Upstream → Client (response) in the current thread
-    let mut buf = [0u8; PIPE_BUF_SIZE];
-    let mut total_response_bytes = 0usize;
+    // Phase 2: Forward the complete request to the php-cgi worker
+    let _ = upstream.set_write_timeout(Some(Duration::from_secs(STREAM_TIMEOUT_SECS)));
+    if upstream.write_all(&request).is_err() {
+        return;
+    }
+    drop(request);
+
+    // Phase 3: Stream the response from worker back to nginx
+    let _ = upstream.set_read_timeout(Some(Duration::from_secs(STREAM_TIMEOUT_SECS)));
+    let _ = client.set_write_timeout(Some(Duration::from_secs(STREAM_TIMEOUT_SECS)));
     loop {
         match upstream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                total_response_bytes += n;
                 if client.write_all(&buf[..n]).is_err() {
                     break;
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-                if total_response_bytes == 0 {
-                    eprintln!("taurio-fpm: upstream timeout with 0 response bytes ({})", e.kind());
-                }
-                break;
-            }
-            Err(ref e) => {
-                if total_response_bytes == 0 {
-                    eprintln!("taurio-fpm: upstream read error with 0 response bytes: {}", e);
-                }
-                break;
-            }
+            Err(_) => break,
         }
     }
+
+    // Graceful close
+    let _ = upstream.shutdown(std::net::Shutdown::Both);
     let _ = client.shutdown(std::net::Shutdown::Write);
-    let _ = t.join();
+
+    // Drain any unread data from nginx to prevent RST on socket drop
+    let _ = client.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut drain = [0u8; 4096];
+    loop {
+        match client.read(&mut drain) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 // ── CLI parsing ─────────────────────────────────────────────────────────
@@ -692,6 +711,7 @@ fn main() {
             }
         };
 
+        let _ = stream.set_nonblocking(false);
         let _ = stream.set_nodelay(true);
 
         // Lock-free acquire — no mutex in the common case
